@@ -2,7 +2,7 @@
 Type=Application
 Name=Battle.net
 Comment=Blizzard Battle.net launcher (patched Wine)
-Exec=sh -c "\\$HOME/.local/bin/battlenet"
+Exec=daemon -f sh -c "\\$HOME/.local/bin/battlenet"
 Icon=battlenet
 Categories=Game;
 StartupNotify=true

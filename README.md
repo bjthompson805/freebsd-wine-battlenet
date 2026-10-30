@@ -142,6 +142,10 @@ After that, run `battlenet`, or install the menu entry:
 install -m 644 launcher/battlenet.desktop ~/.local/share/applications/
 ```
 
+The entry starts the launcher through `daemon -f`, which detaches it into its
+own session. Some app launchers kill everything they started when they close.
+Without detaching, Battle.net gets killed a few seconds after it starts.
+
 The entry uses the icon name `battlenet`. Copy one of the PNGs Wine extracts
 into `~/.local/share/icons/hicolor/<size>/apps/` to `battlenet.png`, or edit
 the `Icon=` line.
