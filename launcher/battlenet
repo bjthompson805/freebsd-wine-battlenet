@@ -1,0 +1,21 @@
+#!/bin/sh
+# Start Battle.net (or another program in the prefix) with the patched Wine.
+#
+#   battlenet                      start the Battle.net launcher
+#   battlenet Battle.net-Setup.exe run a program in the prefix (e.g. the installer)
+#
+#   WINEPREFIX  Wine prefix       default: ~/Games/battlenet
+#   WINE_DIR    patched Wine      default: ~/wine-wc
+export WINEPREFIX="${WINEPREFIX:-$HOME/Games/battlenet}"
+export PATH="${WINE_DIR:-$HOME/wine-wc}/bin:$PATH"
+export WINEDEBUG="${WINEDEBUG:--all}"
+export DXVK_LOG_LEVEL=none
+# The launcher's window renders blank under winewayland; use winex11 (Xwayland).
+unset WAYLAND_DISPLAY
+# locationapi: common Battle.net workaround for hangs at startup.
+# winemenubuilder: menu entries Wine creates would run the unpatched system wine.
+export WINEDLLOVERRIDES="locationapi=d;winemenubuilder.exe=d"
+
+exe="${1:-C:\\Program Files (x86)\\Battle.net\\Battle.net Launcher.exe}"
+[ $# -gt 0 ] && shift
+exec wine "$exe" "$@"
