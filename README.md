@@ -136,14 +136,17 @@ No sysctl changes are needed.
 `build.sh` sparse-clones the ports tree, copies the patches into
 `emulators/wine-devel/files/`, builds and stages the port as your normal user,
 and copies the staged tree to `~/wine-wc`. It doesn't touch the installed
-`wine-devel` package.
+`wine-devel` package. It turns on the port's `PULSEAUDIO` option. Without it,
+Wine only has the OSS and ALSA drivers, and games may not see audio devices
+such as USB headsets.
 
 Install the runtime libraries (the `wine-devel` package pulls them in) and the
 build tools:
 
 ```sh
 sudo pkg install wine-devel winetricks bison gmake autoconf automake flex gcc14 \
-    binutils llvm19 sdl2 evdev-proto xorgproto pkgconf desktop-file-utils
+    binutils llvm19 sdl2 evdev-proto xorgproto pkgconf desktop-file-utils \
+    pulseaudio gstreamer1-plugins
 ./build.sh
 ```
 

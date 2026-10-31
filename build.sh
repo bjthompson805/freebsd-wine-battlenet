@@ -11,7 +11,7 @@ work=${WORK:-$HOME/src/freebsd-wine-battlenet}
 dest=${DEST:-$HOME/wine-wc}
 ports=$work/ports
 port=$ports/emulators/wine-devel
-mk="make -C $port WRKDIRPREFIX=$work/wrk DISTDIR=$work/distfiles BATCH=yes NO_DEPENDS=yes"
+mk="make -C $port WRKDIRPREFIX=$work/wrk DISTDIR=$work/distfiles BATCH=yes NO_DEPENDS=yes WITH=PULSEAUDIO"
 
 if [ ! -d "$ports" ]; then
 	git clone --depth 1 --filter=blob:none --sparse https://git.FreeBSD.org/ports.git "$ports"
