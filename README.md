@@ -1,6 +1,6 @@
 # Battle.net and World of Warcraft on FreeBSD (native Wine)
 
-Two small patches to Wine that get the Blizzard Battle.net launcher working
+Small patches to Wine that get the Blizzard Battle.net launcher working
 on FreeBSD with native Wine, without the Linux compatibility layer
 (linuxulator). With them, the launcher logs in and installs and launches
 World of Warcraft Classic.
@@ -25,6 +25,10 @@ Tested on:
   At that point the browser's renderer process is in state `TX` (stopped and
   traced by `wineserver`). `winedbg` can't attach to processes at all
   (`Can't attach process ...: error 5`).
+- Every time the launcher starts, it shows an **Update** button for an
+  installed game. Clicking it downloads nothing, and afterwards **Play** works.
+  The Agent log (`ProgramData/Battle.net/Agent/Agent.*/Logs/Agent-*.log`) says
+  `Build marked non-playable for <game>: Permissions check failure (2123)`.
 
 The usual Battle.net tips don't help with any of this: turning off hardware
 acceleration, `--disable-gpu`, disabling DXVK for the launcher, or switching
@@ -85,11 +89,39 @@ and delivers it with `PT_DETACH`, so the program still receives it. FreeBSD's
 
 This also fixes `winedbg` failing to attach on FreeBSD.
 
+## Fix 3: keep file and directory ACLs (`wineserver`)
+
+[`patches/patch-server_file.c`](patches/patch-server_file.c),
+[`patches/patch-server_change.c`](patches/patch-server_change.c),
+[`patches/patch-server_file.h`](patches/patch-server_file.h)
+
+The Battle.net Agent gives each install folder an ACL that grants full access
+to Users, Administrators, and Interactive
+(`D:(A;OICI;GA;;;BU)(A;OICI;GA;;;BA)(A;OICI;GA;;;IU)`). On every start it
+checks for that ACL. If the ACL is missing, it marks the game "non-playable"
+and asks for an update. The "update" only verifies the files and sets the ACL
+again.
+
+Upstream Wine doesn't store ACLs on files. Setting one only changes the Unix
+mode bits. Reading one builds a new ACL from the mode bits: SYSTEM, the owner,
+and Everyone. The Agent's ACL is therefore gone by the next start. Proton and
+wine-staging store the whole security descriptor in a `user.wine.sd`
+extended attribute, which is why this doesn't happen with Proton-GE.
+
+The patch does the same. When an ACL is set on a file or directory, it still
+updates the mode bits and also writes the whole descriptor to `user.wine.sd`.
+On FreeBSD that's the `wine.sd` attribute in the `user` extattr namespace. When
+an ACL is read, Wine uses that attribute if it's there and falls back to the
+mode bits otherwise. The format matches Proton's. Files that never had an ACL
+set behave as before. Once a file has the attribute, a later `chmod` from outside
+Wine doesn't change the ACL Wine reports. The filesystem must support
+extended attributes (ZFS and UFS2 do).
+
 ### Optional: mount procfs
 
 When `/proc/<pid>/mem` exists, `wineserver` reads and writes other processes'
 memory with a single `pread`/`pwrite`. Otherwise it uses one `ptrace` call per
-8 bytes. Neither patch needs procfs (this setup works without it), but mounting
+8 bytes. None of the patches need procfs (this setup works without it), but mounting
 it makes these reads much faster:
 
 ```sh
