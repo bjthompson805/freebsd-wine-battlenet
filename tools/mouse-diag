@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Decode the winex11 mouse diagnostics rings (patch-dlls_winex11.drv_mouse.c).
+
+    mouse-diag                 summarize the newest ring (usually Wow.exe)
+    mouse-diag -s 30           only the last 30 seconds
+    mouse-diag -a              print every record, not just the summary
+    mouse-diag --save          copy the ring next to it, stamped, before it wraps
+    mouse-diag FILE.ring ...   decode specific rings
+
+Rings live in $WINE_MOUSE_DIAG (default ~/.cache/wine-mouse-diag).
+"""
+import argparse, datetime, glob, os, shutil, struct, sys
+
+MAGIC = 0x31474149444d5857
+HDR = struct.Struct("<QIIQqi28x")
+REC = struct.Struct("<QIHHiiii")
+TYPES = {1: "motion", 2: "enter", 3: "button", 4: "raw_motion", 5: "raw_button",
+         6: "set_pos", 7: "get_pos", 8: "clip", 9: "unclip", 10: "focus_in",
+         11: "focus_out", 12: "dev_switch", 13: "touch"}
+FOCUS_MODES = ["Normal", "Grab", "Ungrab", "WhileGrabbed"]
+FOCUS_DETAILS = ["Ancestor", "Virtual", "Inferior", "Nonlinear", "NonlinearVirtual",
+                 "Pointer", "PointerRoot", "DetailNone"]
+JUMP = 150  # px between consecutive pointer samples that counts as a jump
+
+
+def load(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    magic, count, size, nxt, offset, pid = HDR.unpack_from(data)
+    if magic != MAGIC or size != REC.size:
+        raise ValueError(f"{path}: not a mouse diag ring")
+    first = max(0, nxt - count)
+    recs = []
+    for i in range(first, nxt):
+        t, tid, typ, flags, a, b, c, d = REC.unpack_from(data, HDR.size + (i % count) * REC.size)
+        if typ:
+            recs.append((t, tid, typ, flags, a, b, c, d))
+    recs.sort(key=lambda r: r[0])
+    return pid, offset, nxt, recs
+
+
+def describe(typ, flags, a, b, c, d):
+    if typ in (1, 2):
+        s = f"win32 {a},{b}  root {c},{d}"
+        if flags & 1: s += "  DROPPED(old serial)"
+        if flags & 2: s += "  [clipping]"
+        return s
+    if typ == 3:
+        return f"btn{flags & 0xff} {'down' if flags & 0x100 else 'up'}  win32 {a},{b}  root {c},{d}"
+    if typ == 4:
+        if flags & 1: return "DROPPED(old serial)"
+        return f"raw {a:+},{b:+}  sent {c:+},{d:+}" + ("  [clipping]" if flags & 2 else "")
+    if typ == 5:
+        return f"btn{flags & 0xff} {'down' if flags & 0x100 else 'up'}  raw {a:+},{b:+}"
+    if typ == 6:
+        res = {0: "ok", 1: "REFUSED(keyboard grabbed)", 2: "REFUSED(grab failed)"}[flags & 0xf]
+        return f"to {a},{b}  root {c},{d}  {res}" + ("  [clipping]" if flags & 0x10 else "")
+    if typ == 7:
+        btns = "".join(n for bit, n in ((1, "L"), (2, "M"), (4, "R")) if flags & bit)
+        s = f"X {a},{b}  win32-before {c},{d}"
+        if (a, b) != (c, d): s += f"  (diff {a - c:+},{b - d:+})"
+        return s + (f"  buttons {btns}" if btns else "")
+    if typ == 8:
+        res = {0: "FAILED", 1: "ok", 2: "REFUSED(keyboard grabbed)", 3: "ok"}[flags & 3]
+        return f"rect {a},{b}-{c},{d}  {res}"
+    if typ == 9:
+        return "was grabbed" if flags else "was not grabbed"
+    if typ in (10, 11):
+        mode, detail = flags & 0xf, (flags >> 4) & 0xf
+        s = f"mode {FOCUS_MODES[mode] if mode < 4 else mode}  detail {FOCUS_DETAILS[detail] if detail < 8 else detail}"
+        s += f"  hwnd {a:#x} fg {b:#x} xwin {c & 0xffffffff:#x}"
+        s += f"  keyboard_grabbed{'(now)' if d else '(before)'}={(flags >> 8) & 1}"
+        return s
+    if typ == 12:
+        return f"source device {a}"
+    if typ == 13:
+        kind = {0: "begin", 1: "update", 2: "end", 3: "END(synthesized)"}.get(flags, flags)
+        return f"{kind} id {a}  win32 {b},{c}" + (f"  device {d}" if flags != 3 else "")
+    return f"flags {flags:#x} {a} {b} {c} {d}"
+
+
+def anomalies(recs):
+    """Yield (index, reason) for records worth a look."""
+    last_pos = None
+    hist = []  # recent distinct get_pos positions, for alternation
+    for i, (t, tid, typ, flags, a, b, c, d) in enumerate(recs):
+        if typ == 6 and flags & 0xf:
+            yield i, "warp refused"
+        if typ == 8 and not flags & 1:
+            yield i, "clip not applied"
+        if typ == 13 and flags in (0, 3):
+            yield i, "touch began" if flags == 0 else "stuck touch released"
+        if typ in (10, 11) and d and (flags >> 8) & 1:
+            yield i, "keyboard_grabbed set"
+        if typ in (1, 2, 7):
+            pos = (a, b)
+            if last_pos and max(abs(pos[0] - last_pos[1][0]), abs(pos[1] - last_pos[1][1])) > JUMP \
+                    and t - last_pos[0] < 100000:
+                yield i, f"pointer jumped {pos[0] - last_pos[1][0]:+},{pos[1] - last_pos[1][1]:+}"
+            last_pos = (t, pos)
+        if typ == 7:
+            if (a, b) != (c, d) and max(abs(a - c), abs(b - d)) > JUMP:
+                yield i, "X and win32 cursor disagree"
+            hist = [h for h in hist if t - h[0] < 500000] + [(t, (a, b))]
+            seq = [p for _, p in hist]
+            flips = sum(1 for j in range(2, len(seq)) if seq[j] == seq[j - 2] and seq[j] != seq[j - 1])
+            if flips >= 4:
+                yield i, "cursor alternating between two positions"
+                hist = []
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("rings", nargs="*")
+    ap.add_argument("-s", "--seconds", type=float, help="only the last N seconds")
+    ap.add_argument("-a", "--all", action="store_true", help="print every record")
+    ap.add_argument("--save", action="store_true", help="copy the ring(s) before they wrap")
+    args = ap.parse_args()
+
+    d = os.environ.get("WINE_MOUSE_DIAG") or os.path.expanduser("~/.cache/wine-mouse-diag")
+    rings = args.rings or sorted(glob.glob(os.path.join(d, "mouse-*.ring")), key=os.path.getmtime)[-1:]
+    if not rings:
+        sys.exit(f"no rings in {d}")
+
+    for path in rings:
+        if args.save:
+            dst = path.replace(".ring", datetime.datetime.now().strftime("-%Y%m%d-%H%M%S.saved"))
+            shutil.copyfile(path, dst)
+            print(f"saved {dst}")
+            path = dst
+        pid, offset, total, recs = load(path)
+        if args.seconds and recs:
+            cut = recs[-1][0] - args.seconds * 1e6
+            recs = [r for r in recs if r[0] >= cut]
+        span = (recs[-1][0] - recs[0][0]) / 1e6 if recs else 0
+        print(f"== {path}  pid {pid}  {total} records written, {len(recs)} shown over {span:.1f}s")
+
+        def line(r, mark=""):
+            t, tid, typ, flags, a, b, c, d = r
+            when = datetime.datetime.fromtimestamp((t + offset) / 1e6).strftime("%H:%M:%S.%f")[:-3]
+            return f"{when} {tid:5x} {TYPES.get(typ, typ):10} {describe(typ, flags, a, b, c, d)}{mark}"
+
+        found = dict(anomalies(recs))
+        if args.all:
+            for i, r in enumerate(recs):
+                print(line(r, f"   <-- {found[i]}" if i in found else ""))
+            continue
+
+        counts = {}
+        for r in recs:
+            counts[TYPES.get(r[2], r[2])] = counts.get(TYPES.get(r[2], r[2]), 0) + 1
+        print("counts: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+        last_focus = [r for r in recs if r[2] in (10, 11)][-3:]
+        if last_focus:
+            print("last focus events:")
+            for r in last_focus: print("  " + line(r))
+        print(f"{len(found)} anomalies" + (" (last 40, with 3 records of context):" if found else ""))
+        shown = set()
+        for i in sorted(found)[-40:]:
+            for j in range(max(0, i - 3), i + 1):
+                if j not in shown:
+                    print(("  * " if j == i else "    ") + line(recs[j], f"   <-- {found[j]}" if j in found else ""))
+                    shown.add(j)
+
+
+if __name__ == "__main__":
+    main()

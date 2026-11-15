@@ -8,7 +8,7 @@ World of Warcraft Classic.
 Tested on:
 
 - FreeBSD 15.1-RELEASE, amd64
-- `emulators/wine-devel` 11.20 from ports (WoW64 build)
+- `emulators/wine-devel` 11.21 from ports (WoW64 build)
 - Battle.net launcher with Chromium Embedded Framework 108.0.5359.125
 - WoW Classic (Anniversary) with DXVK, AMD Radeon 880M (radv)
 - Hyprland, with the launcher running under Xwayland
@@ -131,6 +131,35 @@ sudo mount /proc
 
 No sysctl changes are needed.
 
+## Fix 4: release touches the X server never ended (`winex11`)
+
+[`patches/patch-dlls_winex11.drv_mouse.c`](patches/patch-dlls_winex11.drv_mouse.c),
+[`patches/patch-dlls_winex11.drv_event.c`](patches/patch-dlls_winex11.drv_event.c),
+[`patches/patch-dlls_winex11.drv_x11drv.h`](patches/patch-dlls_winex11.drv_x11drv.h)
+
+On a laptop with a touchscreen, touching the screen while WoW is running can
+break the mouse until `wineserver` exits (`wineserver -k`; restarting WoW alone
+isn't enough). Buttons flicker between hovered and not hovered, and every click
+turns the camera sharply.
+
+Wine passes XInput2 touches to the game as `WM_POINTERDOWN`/`WM_POINTERUP`.
+WoW treats the touch-down as a mouse press and starts mouse-look, which makes
+Wine grab the pointer. Under that grab the X server delivers the finger lift
+only as an emulated button release, never as `XI_TouchEnd`, so Wine never
+sends `WM_POINTERUP`. The contact stays down in `wineserver` and fights the real
+mouse from then on.
+
+The patch tracks touches that have begun but not ended, and sends the missing
+`WM_POINTERUP` for each when Wine grabs or releases the pointer or the window
+loses focus.
+
+The same patches add an optional mouse diagnostics log: with
+`WINE_MOUSE_DIAG=<dir>` set, each process keeps its last 262,144 pointer, touch,
+warp, clip and focus events in `<dir>/mouse-<pid>.ring`, a memory-mapped file
+that can be read while the game runs. [`tools/mouse-diag`](tools/mouse-diag)
+decodes it and flags anomalies. The launcher turns it on; logging costs a few
+memory stores per event.
+
 ## Building
 
 `build.sh` sparse-clones the ports tree, copies the patches into
@@ -152,7 +181,7 @@ sudo pkg install wine-devel winetricks bison gmake autoconf automake flex gcc14 
 
 `WORK=` (build directory, default `~/src/freebsd-wine-battlenet`) and `DEST=`
 (install directory, default `~/wine-wc`) override the defaults. The patches
-were made against wine-devel 11.20. If the port has moved on and a patch no
+were made against wine-devel 11.20 and 11.21. If the port has moved on and a patch no
 longer applies, the changes are small enough to port by hand.
 
 ## Setting up Battle.net

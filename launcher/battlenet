@@ -10,6 +10,10 @@ export WINEPREFIX="${WINEPREFIX:-$HOME/Games/battlenet}"
 export PATH="${WINE_DIR:-$HOME/wine-wc}/bin:$PATH"
 export WINEDEBUG="${WINEDEBUG:--all}"
 export DXVK_LOG_LEVEL=none
+# Mouse diagnostics ring per process (patch-dlls_winex11.drv_mouse.c); read with tools/mouse-diag.
+export WINE_MOUSE_DIAG="${WINE_MOUSE_DIAG:-$HOME/.cache/wine-mouse-diag}"
+mkdir -p "$WINE_MOUSE_DIAG"
+find "$WINE_MOUSE_DIAG" -name 'mouse-*.ring' -mtime +2 -delete
 # The launcher's window renders blank under winewayland; use winex11 (Xwayland).
 unset WAYLAND_DISPLAY
 # locationapi: common Battle.net workaround for hangs at startup.
