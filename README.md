@@ -160,6 +160,32 @@ that can be read while the game runs. [`tools/mouse-diag`](tools/mouse-diag)
 decodes it and flags anomalies. The launcher turns it on; logging costs a few
 memory stores per event.
 
+## FreeBSD/aarch64 (`ntdll`)
+
+[`patches/patch-dlls_ntdll_unix_signal__arm64.c`](patches/patch-dlls_ntdll_unix_signal__arm64.c),
+[`patches/patch-dlls_ntdll_unix_system.c`](patches/patch-dlls_ntdll_unix_system.c)
+
+Upstream Wine's ARM64 signal code knows only Linux and macOS. With these
+patches, a native aarch64 Wine (`--enable-archs=aarch64`) builds and runs on
+FreeBSD 15.1 arm64, tested on an Apple M5 with a 4K-page kernel:
+
+- registers come from `mc_gpregs` (`gp_x[0..29]`, `gp_lr`, `gp_sp`, `gp_elr`
+  for the PC, `gp_spsr`), and FP/SIMD state from `mc_fpregs`, marked
+  `_MC_FP_VALID` on the way back;
+- FreeBSD passes no ESR with a fault, only the exception class as `si_trapno`.
+  The patch rebuilds what Wine needs from it: alignment faults arrive as
+  `SIGBUS`/`BUS_ADRALN`, and read versus write comes from decoding the faulting
+  instruction (a store, or an atomic);
+- `SIGTRAP` uses the same `si_code` handling as Linux;
+- the CPU feature code calls `getauxval`, which FreeBSD lacks; a small shim
+  uses `elf_aux_info` instead.
+
+The Windows side builds with clang 19 from ports (`aarch64_CC=clang19`; the
+base system clang lacks `stddef.h` for other targets) and `lld-link19`
+available as `lld-link`. Pass `CPPFLAGS=-I/usr/local/include
+LDFLAGS=-L/usr/local/lib`, or `configure` misses Vulkan. Install `evdev-proto`
+for the Wayland driver.
+
 ## Building
 
 `build.sh` sparse-clones the ports tree, copies the patches into
