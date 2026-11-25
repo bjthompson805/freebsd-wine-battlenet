@@ -67,7 +67,15 @@
  #endif /* linux */
  
  /* stack layout when calling KiUserExceptionDispatcher */
-@@ -278,6 +323,12 @@ static BOOL save_fpu( NEON128 vregs[32], ULONG *fpcr, ULONG *fpsr, const ucontex
+@@ -183,6 +228,7 @@ C_ASSERT( offsetof(struct callback_stack_layout, sp) == 0x20 );
+ C_ASSERT( sizeof(struct callback_stack_layout) == 0x30 );
+ 
+ #define RESTORE_FLAGS_EMULATION  0x00010000
++#define RESTORE_FLAGS_SINGLE_STEP 0x00020000  /* return through usr2_handler to re-arm PSTATE.SS */
+ 
+ struct syscall_frame
+ {
+@@ -278,6 +324,12 @@ static BOOL save_fpu( NEON128 vregs[32], ULONG *fpcr, ULONG *fpsr, const ucontex
      *fpsr = sigcontext->uc_mcontext->__ns.__fpsr;
      memcpy( vregs, sigcontext->uc_mcontext->__ns.__v, 32 * sizeof(*vregs) );
      return TRUE;
@@ -80,7 +88,7 @@
  #else
      return FALSE;
  #endif
-@@ -302,6 +353,12 @@ static void restore_fpu( const CONTEXT *context, ucontext_t *sigcontext )
+@@ -302,6 +354,12 @@ static void restore_fpu( const CONTEXT *context, ucontext_t *sigcontext )
      sigcontext->uc_mcontext->__ns.__fpcr = context->Fpcr;
      sigcontext->uc_mcontext->__ns.__fpsr = context->Fpsr;
      memcpy( sigcontext->uc_mcontext->__ns.__v, context->V, sizeof(context->V) );
@@ -93,7 +101,7 @@
  #endif
  }
  
-@@ -1176,7 +1233,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+@@ -1176,7 +1234,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
      struct thread_data *data = get_thread_data();
      CONTEXT context;
      EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)PC_sig(sigcontext) };
@@ -102,8 +110,60 @@
  
      switch (ESR_ELx_EC(esr))
      {
-@@ -1263,7 +1320,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+@@ -1247,6 +1305,47 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ }
  
+ 
++static void save_syscall_entry_frame( ucontext_t *sigcontext );
++
++/**********************************************************************
++ *           handle_syscall_trap
++ *
++ * Handle a single-step trap at a syscall dispatcher entry. The PE side
++ * enters the dispatchers with a branch, not svc, so without this a
++ * stepped thread steps through the Unix side too.
++ */
++static BOOL handle_syscall_trap( ucontext_t *sigcontext, siginfo_t *siginfo )
++{
++    extern const ULONG_PTR __wine_syscall_dispatcher_kernel_stack_ptr;
++    extern const ULONG_PTR __wine_unix_call_dispatcher_kernel_stack_ptr;
++    struct syscall_frame *frame = get_syscall_frame( get_thread_data() );
++
++    if (siginfo->si_code != TRAP_TRACE) return FALSE;
++
++    /* disallow single-stepping through a syscall */
++
++    if (PC_sig(sigcontext) == (ULONG_PTR)__wine_syscall_dispatcher)
++    {
++        save_syscall_entry_frame( sigcontext );
++        PC_sig(sigcontext) = __wine_syscall_dispatcher_kernel_stack_ptr;
++    }
++    else if (PC_sig(sigcontext) == (ULONG_PTR)__wine_unix_call_dispatcher)
++    {
++        save_syscall_entry_frame( sigcontext );
++        frame->lr = LR_sig(sigcontext);  /* x9 holds no return address here */
++        PC_sig(sigcontext) = __wine_unix_call_dispatcher_kernel_stack_ptr;
++    }
++    else return FALSE;
++
++    TRACE_(seh)( "ignoring trap in syscall pc=%p\n", (void *)frame->pc );
++
++    /* frame->cpsr keeps SS: the step resumes once the call returns */
++    frame->restore_flags |= RESTORE_FLAGS_SINGLE_STEP;
++    PSTATE_sig(sigcontext) &= ~0x200000;  /* PSTATE.SS */
++    return TRUE;
++}
++
++
+ /**********************************************************************
+  *		trap_handler
+  *
+@@ -1261,9 +1360,11 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+                              .ExceptionAddress = (void *)PC_sig(sigcontext) };
+     DWORD64 esr = 0;
+ 
++    if (handle_syscall_trap( sigcontext, siginfo )) return;
++
      save_context( &context, sigcontext );
  
 -#ifdef linux
@@ -111,7 +171,7 @@
      /* Only SIGSEGV/SIGBUS expose ESR, synthesize it instead. */
      switch (siginfo->si_code)
      {
-@@ -1277,7 +1334,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+@@ -1277,7 +1378,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
          break;
      }
  #else
@@ -120,7 +180,16 @@
  #endif
  
      switch (ESR_ELx_EC(esr))
-@@ -1574,6 +1631,11 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+@@ -1540,6 +1641,8 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+     if (!is_inside_syscall( data, SP_sig(sigcontext) )) return;
+     if (!frame) return;
+ 
++    frame->restore_flags &= ~RESTORE_FLAGS_SINGLE_STEP;
++
+     if (is_emulated_code( frame->pc ))
+     {
+         CONTEXT *user_context = (CONTEXT *)((frame->sp - sizeof(CONTEXT)) & ~15);
+@@ -1574,6 +1677,11 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
      sigcontext->uc_mcontext->__ns.__fpcr = frame->fpcr;
      sigcontext->uc_mcontext->__ns.__fpsr = frame->fpsr;
      memcpy( sigcontext->uc_mcontext->__ns.__v, frame->v, sizeof(frame->v) );
@@ -132,3 +201,15 @@
  #endif
  }
  
+@@ -1841,7 +1949,10 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    __ASM_CFI_CFA_IS_AT2(sp, 0x98, 0x02) /* frame->syscall_cfa */
+                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") ":\n\t"
+                    "ldr w16, [sp, #0x10c]\n\t"  /* frame->restore_flags */
+-                   "tbz x16, #16, 1f\n\t"       /* RESTORE_FLAGS_EMULATION */
++                   "tbz x16, #17, 1f\n\t"       /* RESTORE_FLAGS_SINGLE_STEP */
++                   "str x0, [sp, #0x00]\n\t"    /* frame->x[0] = return value */
++                   "bl " __ASM_NAME("syscall_dispatcher_return_slowpath") "\n"
++                   "1:\ttbz x16, #16, 1f\n\t"   /* RESTORE_FLAGS_EMULATION */
+                    "bl " __ASM_NAME("syscall_dispatcher_return_slowpath") "\n"
+                    "1:\ttbz x16, #1, 2f\n"      /* CONTEXT_INTEGER */
+                    "ldp x12, x13, [sp, #0x80]\n\t" /* frame->x[16..17] */
