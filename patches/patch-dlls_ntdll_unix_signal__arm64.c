@@ -1,6 +1,19 @@
 --- dlls/ntdll/unix/signal_arm64.c.orig
 +++ dlls/ntdll/unix/signal_arm64.c
-@@ -108,7 +108,7 @@ static struct fpsimd_context *get_fpsimd_context( const ucontext_t *sigcontext )
+@@ -67,9 +67,12 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
+ struct arm64_thread_data
+ {
+     BOOL suspend_pending;
++    void *syscall_dispatcher;  /* 02f8 read by the PE syscall thunks (__ASM_SYSCALL_FUNC) */
+ };
+ 
+ C_ASSERT( sizeof(struct arm64_thread_data) <= sizeof(((struct teb_data *)0)->cpu_data) );
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct teb_data, cpu_data ) +
++          offsetof( struct arm64_thread_data, syscall_dispatcher ) == 0x2f8 );
+ 
+ static inline struct arm64_thread_data *arm64_thread_data( struct thread_data *data )
+ {
+@@ -108,7 +111,7 @@ static struct fpsimd_context *get_fpsimd_context( const ucontext_t *sigcontext )
      return (struct fpsimd_context *)get_extended_sigcontext( sigcontext, FPSIMD_MAGIC );
  }
  
@@ -9,7 +22,7 @@
  {
  #ifdef ESR_MAGIC
      struct esr_context *esr = (struct esr_context *)get_extended_sigcontext( sigcontext, ESR_MAGIC );
-@@ -135,11 +135,56 @@ static DWORD64 make_esr( ULONG ec, ULONG info )
+@@ -135,11 +138,56 @@ static DWORD64 make_esr( ULONG ec, ULONG info )
  # define FP_sig(context)            REG_sig(fp, context)    /* Frame pointer */
  # define LR_sig(context)            REG_sig(lr, context)    /* Link Register */
  
@@ -67,7 +80,7 @@
  #endif /* linux */
  
  /* stack layout when calling KiUserExceptionDispatcher */
-@@ -183,6 +228,7 @@ C_ASSERT( offsetof(struct callback_stack_layout, sp) == 0x20 );
+@@ -183,6 +231,7 @@ C_ASSERT( offsetof(struct callback_stack_layout, sp) == 0x20 );
  C_ASSERT( sizeof(struct callback_stack_layout) == 0x30 );
  
  #define RESTORE_FLAGS_EMULATION  0x00010000
@@ -75,7 +88,7 @@
  
  struct syscall_frame
  {
-@@ -278,6 +324,12 @@ static BOOL save_fpu( NEON128 vregs[32], ULONG *fpcr, ULONG *fpsr, const ucontex
+@@ -278,6 +327,12 @@ static BOOL save_fpu( NEON128 vregs[32], ULONG *fpcr, ULONG *fpsr, const ucontex
      *fpsr = sigcontext->uc_mcontext->__ns.__fpsr;
      memcpy( vregs, sigcontext->uc_mcontext->__ns.__v, 32 * sizeof(*vregs) );
      return TRUE;
@@ -88,7 +101,7 @@
  #else
      return FALSE;
  #endif
-@@ -302,6 +354,12 @@ static void restore_fpu( const CONTEXT *context, ucontext_t *sigcontext )
+@@ -302,6 +357,12 @@ static void restore_fpu( const CONTEXT *context, ucontext_t *sigcontext )
      sigcontext->uc_mcontext->__ns.__fpcr = context->Fpcr;
      sigcontext->uc_mcontext->__ns.__fpsr = context->Fpsr;
      memcpy( sigcontext->uc_mcontext->__ns.__v, context->V, sizeof(context->V) );
@@ -101,7 +114,20 @@
  #endif
  }
  
-@@ -1176,7 +1234,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+@@ -324,6 +385,12 @@ static void save_context( CONTEXT *context, const ucontext_t *sigcontext )
+     for (i = 0; i <= 28; i++) context->X[i] = REGn_sig( i, sigcontext );
+     if (save_fpu( context->V, &context->Fpcr, &context->Fpsr, sigcontext ))
+         context->ContextFlags |= CONTEXT_FLOATING_POINT;
++    /* Not saved, but not stack garbage either: World of Warcraft's handler reads them and takes
++     * stale bits for hardware breakpoints ("Game Initialization Failed: I"). */
++    memset( context->Bcr, 0, sizeof(context->Bcr) );
++    memset( context->Bvr, 0, sizeof(context->Bvr) );
++    memset( context->Wcr, 0, sizeof(context->Wcr) );
++    memset( context->Wvr, 0, sizeof(context->Wvr) );
+ }
+ 
+ 
+@@ -1176,7 +1243,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
      struct thread_data *data = get_thread_data();
      CONTEXT context;
      EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)PC_sig(sigcontext) };
@@ -110,7 +136,7 @@
  
      switch (ESR_ELx_EC(esr))
      {
-@@ -1247,6 +1305,47 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+@@ -1247,6 +1314,47 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
  }
  
  
@@ -158,7 +184,7 @@
  /**********************************************************************
   *		trap_handler
   *
-@@ -1261,9 +1360,11 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+@@ -1261,9 +1369,11 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
                               .ExceptionAddress = (void *)PC_sig(sigcontext) };
      DWORD64 esr = 0;
  
@@ -171,7 +197,7 @@
      /* Only SIGSEGV/SIGBUS expose ESR, synthesize it instead. */
      switch (siginfo->si_code)
      {
-@@ -1277,7 +1378,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+@@ -1277,7 +1387,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
          break;
      }
  #else
@@ -180,7 +206,7 @@
  #endif
  
      switch (ESR_ELx_EC(esr))
-@@ -1540,6 +1641,8 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+@@ -1540,6 +1650,8 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
      if (!is_inside_syscall( data, SP_sig(sigcontext) )) return;
      if (!frame) return;
  
@@ -189,7 +215,7 @@
      if (is_emulated_code( frame->pc ))
      {
          CONTEXT *user_context = (CONTEXT *)((frame->sp - sizeof(CONTEXT)) & ~15);
-@@ -1574,6 +1677,11 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+@@ -1574,6 +1686,11 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
      sigcontext->uc_mcontext->__ns.__fpcr = frame->fpcr;
      sigcontext->uc_mcontext->__ns.__fpsr = frame->fpsr;
      memcpy( sigcontext->uc_mcontext->__ns.__v, frame->v, sizeof(frame->v) );
@@ -201,7 +227,20 @@
  #endif
  }
  
-@@ -1841,7 +1949,10 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+@@ -1592,6 +1709,12 @@ NTSTATUS get_thread_ldt_entry( HANDLE handle, THREAD_DESCRIPTOR_INFORMATION *inf
+  */
+ NTSTATUS signal_alloc_thread( TEB *teb )
+ {
++    struct teb_data *teb_data = (struct teb_data *)&teb->GdiTebBatch;
++
++    /* The thunks find the dispatcher here rather than through a literal in ntdll.dll's data, which
++     * only the loader's own mapping has filled: World of Warcraft maps a clean ntdll.dll and calls
++     * system services through it. */
++    ((struct arm64_thread_data *)teb_data->cpu_data)->syscall_dispatcher = __wine_syscall_dispatcher;
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1841,7 +1964,10 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                     __ASM_CFI_CFA_IS_AT2(sp, 0x98, 0x02) /* frame->syscall_cfa */
                     __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") ":\n\t"
                     "ldr w16, [sp, #0x10c]\n\t"  /* frame->restore_flags */
