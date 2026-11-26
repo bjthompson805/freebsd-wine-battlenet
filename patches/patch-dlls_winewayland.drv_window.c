@@ -29,3 +29,18 @@
  /***********************************************************************
   *           WAYLAND_WindowPosChanging
   */
+@@ -577,9 +599,13 @@ static void wayland_configure_window(HWND hwnd)
+         return;
+     }
+ 
++    /* The surface shows the visible rect: with the non-client area the
++     * compositor stands in for (WAYLAND_GetWindowStyleMasks), the window
++     * rect is larger, as winex11 handles it. */
+     SetRect(&rect, 0, 0, width, height);
+     rect = map_rect_from_surface(surface, rect);
+-    OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
++    OffsetRect(&rect, data->rects.visible.left, data->rects.visible.top);
++    rect = window_rect_from_visible(&data->rects, rect);
+ 
+     wayland_win_data_release(data);
+ 
